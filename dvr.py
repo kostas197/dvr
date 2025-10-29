@@ -5,20 +5,22 @@ import logging
 from datetime import datetime
 import signal
 import sys
+import threading
 
 class DVRBackend:
-    def __init__(self, rtsp_url, output_dir="dvr_recordings", chunk_duration=300):
+    def __init__(self, rtsp_url, output_dir="dvr_recordings", chunk_duration=300, max_dvr_size_gb=4):
         self.rtsp_url = rtsp_url
         self.output_dir = output_dir
-        self.chunk_duration = chunk_duration  # 5 minutos por defecto
+        self.chunk_duration = chunk_duration  # 5 minutes by default
+        self.max_dvr_size_gb = max_dvr_size_gb
         self.is_recording = False
         self.current_process = None
         
-        # Configurar logging
+        # Set up logging
         self.setup_logging()
         
     def setup_logging(self):
-        """Configurar sistema de logging"""
+        """Set up the logging system."""
         os.makedirs('logs', exist_ok=True)
         
         logging.basicConfig(
@@ -32,36 +34,41 @@ class DVRBackend:
         self.logger = logging.getLogger('DVRBackend')
         
     def check_ffmpeg(self):
-        """Verificar si FFmpeg está disponible"""
+        """Check if FFmpeg is available."""
         try:
             subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-            self.logger.info("✅ FFmpeg verificado correctamente")
+            self.logger.info("✅ FFmpeg check successful.")
             return True
         except Exception as e:
-            self.logger.error(f"❌ Error con FFmpeg: {e}")
+            self.logger.error(f"❌ FFmpeg error: {e}")
             return False
     
     def get_current_timestamp(self):
-        """Obtener timestamp formateado"""
+        """Get a formatted timestamp."""
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     def create_output_directory(self):
-        """Crear directorio de salida con fecha"""
+        """Create the output directory with the current date."""
         date_str = datetime.now().strftime("%Y-%m-%d")
         full_output_dir = os.path.join(self.output_dir, date_str)
         os.makedirs(full_output_dir, exist_ok=True)
         return full_output_dir
     
     def start_recording(self):
-        """Iniciar grabación continua"""
+        """Start the continuous recording process."""
         if not self.check_ffmpeg():
             return False
             
         self.is_recording = True
-        self.logger.info("🚀 Iniciando backend DVR...")
+        self.logger.info("🚀 Starting DVR backend...")
         self.logger.info(f"📹 RTSP URL: {self.rtsp_url.split('@')[0]}******")
+
+        # Start the garbage collector thread
+        gc_thread = threading.Thread(target=self.garbage_collector_loop, daemon=True)
+        gc_thread.start()
+        self.logger.info("🗑️ Garbage collector started.")
         
-        # Manejar señal de terminación
+        # Handle termination signals
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         
@@ -71,27 +78,27 @@ class DVRBackend:
         while self.is_recording and restart_count < max_restarts:
             try:
                 output_dir = self.create_output_directory()
-                timestamp = datetime.now().strftime("%H-%M-%S")
                 
-                self.logger.info(f"📁 Grabando en directorio: {output_dir}")
+                self.logger.info(f"📁 Recording to directory: {output_dir}")
                 
                 cmd = [
                     'ffmpeg',
                     '-rtsp_transport', 'tcp',
+                    '-timeout', '30000000',  # 30-second timeout for input
                     '-use_wallclock_as_timestamps', '1',
+                    '-fflags', '+genpts',
                     '-i', self.rtsp_url,
                     '-c', 'copy',
                     '-f', 'segment',
                     '-segment_time', str(self.chunk_duration),
-                    '-segment_format', 'mp4',
-                    '-segment_format_options', 'movflags=+faststart',
+                    '-segment_format', 'mpegts',
                     '-reset_timestamps', '1',
                     '-avoid_negative_ts', 'make_zero',
                     '-strftime', '1',
-                    os.path.join(output_dir, 'chunk_%Y-%m-%d_%H-%M-%S.mp4')
+                    os.path.join(output_dir, 'chunk_%Y-%m-%d_%H-%M-%S.ts')
                 ]
                 
-                self.logger.info("🎥 Iniciando grabación...")
+                self.logger.info("🎥 Starting recording...")
                 self.current_process = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
@@ -99,85 +106,138 @@ class DVRBackend:
                     stderr=subprocess.PIPE
                 )
                 
-                # Monitorear el proceso
+                # Monitor the process
                 self.monitor_ffmpeg_process()
                 
                 restart_count += 1
                 if self.is_recording:
-                    wait_time = min(restart_count * 10, 60)  # Backoff exponencial
-                    self.logger.warning(f"🔄 Reiniciando grabación en {wait_time} segundos...")
+                    wait_time = min(restart_count * 10, 60)  # Exponential backoff
+                    self.logger.warning(f"🔄 Restarting recording in {wait_time} seconds...")
                     time.sleep(wait_time)
                     
             except Exception as e:
-                self.logger.error(f"💥 Error crítico: {e}")
+                self.logger.error(f"💥 Critical error: {e}")
                 time.sleep(30)
                 
         if restart_count >= max_restarts:
-            self.logger.error("🛑 Máximo número de reinicios alcanzado. Deteniendo...")
+            self.logger.error("🛑 Maximum restart limit reached. Stopping...")
     
     def monitor_ffmpeg_process(self):
-        """Monitorear el proceso de FFmpeg y loggear eventos"""
+        """Monitor the FFmpeg process and log events."""
         while self.current_process and self.current_process.poll() is None:
             try:
-                # Leer salida de FFmpeg para detectar nuevos archivos
+                # Read FFmpeg's output to detect new files
                 output_bytes = self.current_process.stderr.readline()
                 if not output_bytes:
                     break
                 output = output_bytes.decode('utf-8', errors='ignore')
 
-                if "Opening" in output and ".mp4" in output:
-                    self.logger.info(f"📄 Nuevo archivo creado: {output.strip()}")
+                if "Opening" in output and ".ts" in output:
+                    self.logger.info(f"📄 New file created: {output.strip()}")
                 elif "frame=" in output and "fps=" in output:
-                    # Log cada 100 frames aproximadamente
+                    # Log progress roughly every 100 frames
                     if "frame=" in output:
-                        print(f"📊 {datetime.now().strftime('%H:%M:%S')} - Grabando...", end='\r')
+                        print(f"📊 {datetime.now().strftime('%H:%M:%S')} - Recording...", end='\r')
                 else:
                     self.logger.info(f"FFMPEG_STDERR: {output.strip()}")
             except Exception as e:
-                # Este error puede ocurrir si el proceso termina mientras leemos, es normal al parar.
+                # This can happen if the process is terminated while reading, which is normal on stop.
                 if self.is_recording:
                     self.logger.error(f"Error reading ffmpeg output: {e}")
                 break
                 
-        # Proceso terminado
+        # Process has finished
         if self.current_process:
             return_code = self.current_process.poll()
             if return_code != 0 and self.is_recording:
-                self.logger.warning(f"⚠️ FFmpeg terminó con código: {return_code}")
+                self.logger.warning(f"⚠️ FFmpeg terminated with code: {return_code}")
+
+    def garbage_collector(self):
+        """Deletes oldest recordings if DVR size exceeds the limit."""
+        max_size_bytes = self.max_dvr_size_gb * 1024 * 1024 * 1024
+        
+        try:
+            files = []
+            current_size_bytes = 0
+            for dirpath, _, filenames in os.walk(self.output_dir):
+                for f in filenames:
+                    if f.endswith('.ts'):
+                        fp = os.path.join(dirpath, f)
+                        try:
+                            file_size = os.path.getsize(fp)
+                            file_mtime = os.path.getmtime(fp)
+                            current_size_bytes += file_size
+                            files.append((file_mtime, file_size, fp))
+                        except OSError:
+                            continue # File might have been deleted between listing and stat
+
+            self.logger.info(f"Garbage Collector: Current DVR size is {current_size_bytes / (1024**3):.2f} GB. Max size is {self.max_dvr_size_gb} GB.")
+
+            if current_size_bytes > max_size_bytes:
+                self.logger.warning("DVR size exceeds limit. Deleting oldest files...")
+                # Sort files by modification time (oldest first)
+                files.sort()
+                
+                while current_size_bytes > max_size_bytes and files:
+                    mtime, size, path = files.pop(0) # Get oldest file
+                    try:
+                        self.logger.info(f"Deleting old file: {path} ({size / (1024**2):.2f} MB)")
+                        os.remove(path)
+                        current_size_bytes -= size
+                    except OSError as e:
+                        self.logger.error(f"Error deleting file {path}: {e}")
+
+            # Clean up empty directories
+            for dirpath, dirnames, filenames in os.walk(self.output_dir, topdown=False):
+                if not dirnames and not filenames:
+                    try:
+                        os.rmdir(dirpath)
+                        self.logger.info(f"Removed empty directory: {dirpath}")
+                    except OSError as e:
+                        self.logger.error(f"Error removing empty directory {dirpath}: {e}")
+        except Exception as e:
+            self.logger.error(f"Error in garbage collector: {e}")
+
+    def garbage_collector_loop(self):
+        """Runs the garbage collector periodically."""
+        while self.is_recording:
+            self.garbage_collector()
+            # Wait for an hour
+            time.sleep(3600)
     
     def signal_handler(self, signum, frame):
-        """Manejar señales de terminación"""
-        self.logger.info(f"🛑 Señal {signum} recibida. Deteniendo grabación...")
+        """Handle termination signals."""
+        self.logger.info(f"🛑 Signal {signum} received. Stopping recording...")
         self.stop_recording()
     
     def stop_recording(self):
-        """Detener grabación de forma controlada."""
+        """Stop the recording gracefully."""
         self.is_recording = False
         if self.current_process and self.current_process.poll() is None:
-            self.logger.info("⏹️ Enviando señal de parada a FFmpeg (q) para finalizar el archivo correctamente...")
+            self.logger.info("⏹️ Sending stop signal to FFmpeg (q) to finalize file...")
             try:
-                # Enviamos b'q' (bytes) al stdin de ffmpeg para que termine de forma controlada
+                # Send 'q' to ffmpeg's stdin for a graceful shutdown
                 self.current_process.stdin.write(b'q')
                 self.current_process.stdin.close()
-                # Esperamos a que el proceso termine
+                # Wait for the process to terminate
                 self.current_process.wait(timeout=15)
             except (IOError, ValueError, BrokenPipeError):
-                # Si falla la comunicación por stdin, forzamos la terminación
-                self.logger.warning("No se pudo comunicar con FFmpeg. Forzando terminación (el último archivo podría estar corrupto).")
+                # If stdin communication fails, force termination
+                self.logger.warning("Could not communicate with FFmpeg. Forcing termination (last file may be corrupt).")
                 self.current_process.terminate()
                 try:
                     self.current_process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     self.current_process.kill()
             except subprocess.TimeoutExpired:
-                # Si no responde, forzamos la terminación
-                self.logger.warning("FFmpeg no respondió a la señal de parada. Forzando terminación (el último archivo podría estar corrupto).")
+                # If it doesn't respond, force termination
+                self.logger.warning("FFmpeg did not respond to stop signal. Forcing termination (last file may be corrupt).")
                 self.current_process.kill()
         
-        self.logger.info("✅ Backend DVR detenido correctamente")
+        self.logger.info("✅ DVR backend stopped correctly.")
     
     def get_status(self):
-        """Obtener estado del DVR"""
+        """Get the DVR status."""
         return {
             "recording": self.is_recording,
             "output_dir": self.output_dir,
@@ -185,29 +245,35 @@ class DVRBackend:
             "chunk_duration": self.chunk_duration
         }
 
-# Configuración y ejecución
+# Configuration and execution
 if __name__ == "__main__":
-    # Configuración - MODIFICA ESTOS VALORES
-    USUARIO = sys.argv[1]
-    CONTRASEÑA = sys.argv[2]
-    IP_CAMARA = sys.argv[3]
-    RUTA_STREAM = ""  # Ej: "h264", "main", "sub", etc.
+    # Check for necessary command-line arguments
+    if len(sys.argv) < 4:
+        print("Usage: python dvr.py <user> <password> <camera_ip>")
+        sys.exit(1)
+
+    # Configuration from command-line arguments
+    USER = sys.argv[1]
+    PASSWORD = sys.argv[2]
+    CAMERA_IP = sys.argv[3]
+    STREAM_PATH = ""  # Optional, e.g., "h264", "main", "sub", etc.
     
-    # Construir URL RTSP
-    RTSP_URL = f"rtsp://{USUARIO}:{CONTRASEÑA}@{IP_CAMARA}:554/{RUTA_STREAM}"
+    # Build RTSP URL
+    RTSP_URL = f"rtsp://{USER}:{PASSWORD}@{CAMERA_IP}:554/{STREAM_PATH}"
     
-    # Crear instancia del DVR
+    # Create DVR instance
     dvr = DVRBackend(
         rtsp_url=RTSP_URL,
         output_dir="dvr_recordings",
-        chunk_duration=300  # 5 minutos por chunk
+        chunk_duration=300,  # 5 minutes per chunk
+        max_dvr_size_gb=4    # Set max DVR size to 4 GB
     )
     
-    # Iniciar grabación
+    # Start recording
     try:
         dvr.start_recording()
     except KeyboardInterrupt:
         dvr.stop_recording()
     except Exception as e:
-        dvr.logger.error(f"💥 Error no manejado: {e}")
+        dvr.logger.error(f"💥 Unhandled error: {e}")
         dvr.stop_recording()
